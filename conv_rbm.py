@@ -3,123 +3,142 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-class ProbMaxPool:
+from expander import MatrixExpander
+
+
+LOSS_NAMES                                  = ['recon', 'sparsity']
+
+class ProbMaxPool(nn.Module):
     def __init__(self, mp):
-        self.mp = mp
+        super(ProbMaxPool, self).__init__()
+        self.mp                             = mp
+        pool_filter                         = torch.FloatTensor(1, 1, self.mp, self.mp).fill_(1)
+        self.register_buffer('pool_filter', pool_filter)
         return
 
-    def get_probs(self, H):
-        batch_size, n_channels, rows, cols = H.size()
+    def pooler(self, H):
+        batch_size, n_channels, rows, cols  = H.size()
+        H_pooled                            = F.conv2d(H, self.pool_filter.expand(n_channels, n_channels, -1, -1), stride=self.mp, padding=0)
+        return H_pooled
 
-        filt = torch.FloatTensor(self.mp,self.mp).fill_(1).cuda()
-        filt = filt.view(1, 1, self.mp, self.mp)
-        fv   = Variable(filt, requires_grad=False)
+    def forward(self, H):
+        batch_size, n_channels, rows, cols  = H.size()
 
-        H_e  = torch.exp(H)
-        rv   = 1 + torch.cat([F.conv2d(H[:,i,:,:].unsqueeze(1), fv, stride=self.mp) for i in range(H.size(1))], 1)
+        if not hasattr(self, 'expander'):
+            self.expander                   = MatrixExpander((rows // self.mp, cols // self.mp), self.mp).cuda()
+        
+#        print('H size before exp (H): ', H.size())
+        H_exp                               = torch.exp(H)
 
-        H_se = rv.unsqueeze(4).repeat(1,1,1,1,self.mp*self.mp)
-        H_se = H_se.view(batch_size, n_channels, rows/self.mp, self.mp*self.mp, cols/self.mp)
-        H_se = H_se.transpose(3,4).contiguous()
-        H_se = H_se.view(batch_size, n_channels, rows, cols)
+#        print('H size before pool (H_exp): ', H_exp.size())
+        H_pooled                            = self.pooler(H_exp) 
+#        print('H size after pool (H_pooled): ', H_pooled.size())
+        H_pooled_ex                         = self.expander(H_pooled)
+#        print('H_size after expand (H_pooled_ex): ', H_pooled_ex.size())
 
-        H_probs = H_e/H_se        
+        H_probs                             = H_exp / (1 + H_pooled_ex)
+
         return H_probs
-
-    def pool_from_probs(self, H_probs):
-        pass
 
 
 class ConvRBM(nn.Module):
-    def __init__(self, ws, in_channels, out_channels, mp, sparsity, sigm=False, reuse_vbias=False, k_CD=1):
+    def __init__(self, options):
         super(ConvRBM, self).__init__()
 
-        self.ws             = ws
-        self.in_channels    = in_channels
-        self.out_channels   = out_channels
-        self.mp             = mp    
-        self.sparsity       = sparsity
-        self.sigm           = sigm
-        self.reuse_vbias    = reuse_vbias
-        self.k_CD           = 1
-   
-        self.dW_prev        = torch.FloatTensor(in_channels, out_channels, ws, ws).fill_(0)
-        self.db_prev        = torch.FloatTensor(out_channels).fill_(0)
+        self.options                        = options
+        self.ws                             = options.model.weight_size
+        self.in_channels                    = options.model.channels
+        self.out_channels                   = options.model.num_weights
+        self.mp                             = options.model.pool_size
+        self.sparsity                       = options.model.sparsity
+        self.sigm                           = options.model.sigmoid
+        self.reuse_vbias                    = options.model.use_vbias
+        self.k_CD                           = options.model.k_CD
 
-        self.forward_conv   = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, ws, 1, 0, bias=True)
-        )
-        self.backward_conv       = nn.Sequential(
-                nn.Conv2d(out_channels, in_channels, ws, 1, ws-1, bias=True)
-        )
-        self.prob_max_pool  = ProbMaxPool(mp)
-        return
+        self.prob_max_pool                  = ProbMaxPool(self.mp)
 
-    def forward_pass(self, X=None):
-        if X is None:
-            self.hid_in = self.forward_conv(self.vis_probs)
-        else:
-            self.hid_in = self.forward_conv(X)
-        return
+        self._loss_scaling_dict             = []
+        for _loss_name in LOSS_NAMES:
+            self._loss_scaling_dict[_loss_name] = getattr(options.training, 'scale_' + _loss_name, 0)
 
-    def backward_pass(self):
-        self.vis_probs = self.backward_conv(self.hid_probs)
-        if self.sigm:
-            self.vis_probs = F.sigmoid(self.vis_probs)
-        return
+        W_data                              = 1e-4 * (torch.FloatTensor(out_channels, in_channels, ws, ws).random_()%1000)
+        bh_data                             = 1e-4 * (torch.FloatTensor(out_channels).random_()%1000)/1000.0
+        bv_data                             = 1e-4 * (torch.FloatTensor(in_channels).random_()%1000)/1000.0
 
-    def copy_transposed_weights(self):
-        W = self.forward_conv.state_dict()['0.weight'].transpose(0,1).transpose(2,3).contiguous()
-        self.backward_conv.state_dict()['0.weight'] = W
-        return
+        self.W                              = nn.Parameter(data=W_data)
+        self.bh                             = nn.Parameter(data=bh_data)
+        self.bv                             = nn.Parameter(data=bv_data)
 
-    def CD(self):
-        self.copy_transposed_weights()
-        self.backward_pass() 
+    def forward_conv(self, X):
+        H                                   = F.conv2d(X, self.W, bias=self.bh, stride=1, padding=0)
+        return H
 
-        self.forward_pass()
-        self.hid_probs = self.prob_max_pool.get_probs(self.hid_in)
+    def backward_conv(self, H):
+        pad                                 = self.ws - 1
+        bias                                = self.bv if self.reuse_vbias else None
+        Xhat                                = F.conv2d(H, self.W.transpose(0,1).transpose(2,3), bias=bias, stride=1, padding=pad)
+        return Xhat
 
+    def CD(self, X):
+        self.H                              = self.forward_conv(X)
+        self.Hprobs                         = self.prob_max_pool(self.H)
+        self.Xhat                           = self.backward_conv(self.Hprobs)
 
-    def step(self, X):
-        self.X          = X
-        self.forward_pass(X=X)
-        self.hid_probs  = self.prob_max_pool.get_probs(self.hid_in)
-        self.hid_probs0 = self.hid_probs.clone()
-    
+        return self.Xhat
+
+    def forward(self, X):
+        self.X                              = X
         for k in range(self.k_CD):
-            self.CD()
+            if k == 0:
+                self.CD(X)
+                self.Hprobs0                = self.Hprobs.clone()
+            else:
+                self.CD(self.Xhat)
+        # Final forward pass, get H from X
+        self.H                              = self.forward_conv(self.Xhat)
+        self.Hprobs                         = self.prob_max_pool(self.H)
 
-    def update(self, lr, momentum=0, l2_reg=0.1, lr_sparse=0.1):
-        n_hid_units = self.hid_probs.size(2)*self.hid_probs.size(3)
-        n_vis_units = self.vis_probs.size(2)*self.vis_probs.size(3)
+        return self.Xhat
 
-        H_se_T  = self.hid_probs.transpose(2,3)
-        H_se_T0 = self.hid_probs0.transpose(2,3)
+    def compute_updates(self):
+        batch_size                          = self.Hprobs.size(0)
+        n_hidden                            = self.Hprobs.size(2) * self.Hprobs.size(3)
 
-        W       = self.forward_conv.state_dict()['0.weight']
+        for w in range(self.out_channels):
+            for bs in range(batch_size):
+                __conv                      = F.conv2d(self.X[bs:bs+1,:,:,:], self.Hprobs0[bs:bs+1,w:w+1,:,:].transpose(2,3), stride=1, padding=0)
+                if bs == 0:
+                    _conv                   = __conv
+                else:
+                    _conv                   = _conv + __conv
+            
+            _conv                           = 1./batch_size * _conv
+#            _conv                           = F.conv2d(self.X, self.Hprobs0[:,[w],:,:].transpose(2,3), stride=1, padding=0)
 
-        deltaW  = torch.FloatTensor(W.size())
+            if w == 0:
+                W_grad                      = _conv
+            else:
+                W_grad                      = torch.cat((W_grad, _conv), dim=0)
+#        conv1                               = F.conv2d(self.X, self.Hprobs0.transpose(2,3), stride=1, padding=0)
+#        conv2                               = F.conv2d(self.Xhat, self.Hprobs.transpose(2,3), stride=1, padding=0)
+#        self.W.grad                         = 1./batch_size * 1./n_hidden * (conv1 - conv2)
+        self.W.grad                         = 1./n_hidden * 1./batch_size * W_grad
 
-        batch_size = self.X.size(0)
+        dbiash                              = (self.Hprobs0 - self.Hprobs).view(batch_size,-1,n_hidden).mean(dim=2).mean(dim=0) 
+        sparsity                            = self.sparsity - self.Hprobs.view(batch_size,-1,n_hidden).mean(dim=2).mean(dim=0)
+        self.bh.grad                        = self._loss_scaling_dict['sparsity'] * (dbiash + sparsity)
 
-        for c in range(self.in_channels):
-            for i in range(batch_size):
-                deltaW[c,:,:,:] = 1.0/n_hid_units*(F.conv2d(self.X[i,:,:,:], H_se_T0) - F.conv2d(self.vis_probs[i,:,:,:], H_se_T[i,))   # FIX
-            deltaW[c,:,:,:]     = 1.0/batch_size*deltaW
-            deltaW[c,:,:,:]    += momentum*(self.dW_prev[c,:,:,:])
-            deltaW[c,:,:,:]    += l2_reg*W[c,:,:,:]
+        if self.reuse_vbias:
+            n_visible                       = self.X.size(2) * self.X.size(3)
+            dbiasv                          = (self.Xhat - self.X).view(batch_size,-1,n_visible).mean(dim=2).mean(dim=0)
+            self.bv.grad                    = dbiasv
 
+        return
 
-        db_sparse   = self.sparsity - torch.mean(torch.sum(torch.sum(self.hid_probs, axis=3), axis=2), axis=0)
-        db          = torch.mean(torch.sum(torch.sum(self.hid_probs0 - self.hid_probs, axis=3), axis=2), axis=0)  # Possible optimisation here. 
-        db          = 1.0/n_hid_units*db + lr_sparse*db_sparse
-        db         += momentum*(self.db_prev)
+    def compute_losses(self):
+        self.loss_recon                     = self._loss_scaling_dict['recon'] * torch.mean((self.X - self.Xhat) ** 2)
+        self.loss_sparsity                  = self._loss_scaling_dict['sparsity'] * (self.sparsity - torch.mean(self.Hprobs)) ** 2
 
-        # We do not update the visible biases for now. 
-        self.dW_prev = deltaW
-        self.db_prev = db
+        self.loss_total                     = self.loss_recon + self.loss_sparsity
+        return self.loss_total
 
-        # Update. 
-        self.forward_conv.state_dict()['0.weight'] += lr*deltaW
-        self.forward_conv.state_dict()['0.bias']   += lr*db
