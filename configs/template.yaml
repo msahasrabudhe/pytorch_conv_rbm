@@ -1,0 +1,30 @@
+model:
+    channels: 1
+    weight_size: 11
+    num_weights: 64
+    pool_size: 2
+    sparsity: 0.003
+    sigmoid: False
+    use_vbias: False
+    k_CD: 1
+
+optimiser: 
+    lr: 0.0001
+    beta1: 0.5
+    beta2: 0.999
+
+training:
+    load_model: ''
+    patch_size: 28
+    cuda: True
+    dataset_file: natural.npy
+    n_iter: 100000
+    batch_size: 64
+    weight_decay: 0.0001
+    lr_decay: 0.2
+    lr_decay_step: [12000, 24000]
+    scale_recon: 1.0
+    scale_sparsity: 1000
+
+checkpoint:
+    step: 1000
