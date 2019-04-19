@@ -113,15 +113,11 @@ class ConvRBM(nn.Module):
                     _conv                   = _conv + __conv
             
             _conv                           = 1./batch_size * _conv
-#            _conv                           = F.conv2d(self.X, self.Hprobs0[:,[w],:,:].transpose(2,3), stride=1, padding=0)
 
             if w == 0:
                 W_grad                      = _conv
             else:
                 W_grad                      = torch.cat((W_grad, _conv), dim=0)
-#        conv1                               = F.conv2d(self.X, self.Hprobs0.transpose(2,3), stride=1, padding=0)
-#        conv2                               = F.conv2d(self.Xhat, self.Hprobs.transpose(2,3), stride=1, padding=0)
-#        self.W.grad                         = 1./batch_size * 1./n_hidden * (conv1 - conv2)
         self.W.grad                         = 1./n_hidden * 1./batch_size * W_grad
 
         dbiash                              = (self.Hprobs0 - self.Hprobs).view(batch_size,-1,n_hidden).mean(dim=2).mean(dim=0) 
