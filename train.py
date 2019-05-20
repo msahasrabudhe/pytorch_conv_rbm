@@ -1,6 +1,8 @@
 from conv_rbm import *
 from DataLoader import *
 
+import torchvision.utils as vutils
+
 from attr_dict import make_recursive_attr_dict
 import yaml
 
@@ -29,30 +31,31 @@ def main():
 
     output_path                 = os.path.join('output/', exp_name)
 
+    for odir in ['images/input/', 'images/hidden/', 'images/reconstruction/', 'images/weights/', 'images/hbias/']:
+        if not os.path.exists(os.path.join(output_path, odir)):
+            os.makedirs(os.path.join(output_path, odir))
+
     with open(args.cfg, 'r') as fp:
         options                 = yaml.safe_load(fp)
 
     options                     = make_recursive_attr_dict(options)
 
-    model                       = ConvRBM(
-                                    options.model.weight_size,
-                                    options.model.channels,
-                                    options.model.num_weights,
-                                    options.model.pool_size,
-                                    options.model.sparsity,
-                                    sigm=options.model.sigmoid,
-                                    reuse_vbias=options.model.use_vbias,
-                                    k_CD=options.model.k_CD
-                                  )
+    model                       = ConvRBM(options)
 
     if options.training.cuda:
         model.cuda()
         
-    optimiser                   = optim.Adam(
-                                    model.parameters(), 
-                                    lr=options.optimiser.lr, 
-                                    betas=(options.optimiser.beta1, options.optimiser.beta2),
-                                    weight_decay=options.training.weight_decay,
+#    optimiser                   = optim.Adam(
+#                                    model.parameters(), 
+#                                    lr=options.optimiser.lr, 
+#                                    betas=(options.optimiser.beta1, options.optimiser.beta2),
+#                                    weight_decay=options.training.weight_decay,
+#                                  )
+    optimiser                   = optim.SGD(
+                                    model.parameters(),
+                                    lr=options.optimiser.lr,
+                                    momentum=0,
+                                    weight_decay=0
                                   )
 
     dataloader                  = DataLoader(options.training.dataset_file)
@@ -60,6 +63,9 @@ def main():
     loss_recon_history          = []
     loss_sparsity_history       = []
     iter_mark                   = 0
+    epoch                       = 0
+
+    wid                         = 0
 
     def save_model(output_path='output/foo/'):
         if not os.path.exists(output_path):
@@ -72,7 +78,8 @@ def main():
         system_state            = {
             'loss_recon_history'    : loss_recon_history,
             'loss_sparsity_history' : loss_sparsity_history,
-            'iter_mark'             : iter_mark
+            'iter_mark'             : iter_mark,
+            'epoch'                 : epoch,
         }
         with open(os.path.join(output_path, 'system_state.pkl'), 'wb') as fp:
             pickle.dump(system_state, fp)
@@ -88,15 +95,20 @@ def main():
         loss_recon_history      = system_state['loss_recon_history']
         loss_sparsity_history   = system_state['loss_sparsity_history']
         iter_mark               = system_state['iter_mark']
+        epoch                   = system_state['epoch']
 
-    if options.training.load_model != '':
+    if options.training.load_model is not None:
         print('Resuming from old model at %s.' %(options.training.load_model))
         load_model(options.training.load_model)
 
-    while iter_mark < options.training.n_iter:
-        optimiser.zero_grad()
+    model.set_lr(epoch)
 
-        X                       = dataloader.next_batch(options.training.batch_size, options.training.patch_size)
+    while iter_mark < options.training.n_iter:
+#        optimiser.zero_grad()
+        model.reset_grad()
+        model.set_momentum(iter_mark)
+
+        X, last_batch           = dataloader.next_batch(options.training.batch_size, options.training.patch_size)
 
         if options.training.cuda:
             X                   = X.cuda()
@@ -105,6 +117,7 @@ def main():
 
         loss_total              = model.compute_losses()
         model.compute_updates()
+        model.update()
 
         loss_recon              = model.loss_recon
         loss_sparsity           = model.loss_sparsity
@@ -112,19 +125,62 @@ def main():
         loss_recon_history.append(loss_recon.item())
         loss_sparsity_history.append(loss_sparsity.item())
         
-        optimiser.step()
 
-        write_flush('\r' + ' ' * 100 + '\rIteration %5d . LR = %g | recon: %.4f . sparsity: %.4f' %(iter_mark, optimiser.param_groups[0]['lr'], loss_recon.item(), loss_sparsity.item()))
+        write_flush('\r' + ' ' * 150 + '\rIteration %5d . LR = %.4g | recon: %.4f . sparsity: %.4f . momentum = %.4f . std_gaussian = %.4f ; ||W|| = %.4f . ||bh|| = %.4f . ||bv|| = %.4f . ||dW|| = %.4f . ||dHbias|| = %.4f . mean(Hprobs) = %.4f' 
+                %(iter_mark, model.lr, loss_recon.item(), loss_sparsity.item(), model.momentum, model.std_gaussian,
+                  torch.norm(model.W), torch.norm(model.bh), torch.norm(model.bv), torch.norm(model.W.grad), torch.norm(model.bh.grad), model.Hprobs0.mean()))
+        if options.model.use_vbias:
+            write_flush(' .||dVbias|| = %.4f' %(torch.norm(model.bv.grad)))
 
-        if (iter_mark + 1) % 500 == 0:
+#        optimiser.step()
+
+        if iter_mark % 500 == 0:
             write_flush('\n')
 
         if (iter_mark + 1) % options.checkpoint.step == 0:
             save_model(output_path=output_path)
 
-        if (iter_mark + 1) in options.training.lr_decay_step:
-            for pg in optimiser.param_groups:
-                pg['lr']       *= options.training.lr_decay
+            vutils.save_image(
+                    X,
+                    os.path.join(output_path, 'images/input/%06d.png' %(iter_mark)),
+                    nrow=int(np.floor(np.sqrt(options.training.batch_size))),
+                    normalize=True,
+            )
+            vutils.save_image(
+                    X_hat, 
+                    os.path.join(output_path, 'images/reconstruction/%06d.png' %(iter_mark)),
+                    nrow=int(np.floor(np.sqrt(options.training.batch_size))),
+                    normalize=True,
+            )
+            vutils.save_image(
+                    model.Hprobs0[0,:,:,:].unsqueeze(1), 
+                    os.path.join(output_path, 'images/hidden/%06d.png' %(iter_mark)),
+                    nrow=int(np.floor(np.sqrt(options.model.num_weights))),
+                    normalize=True,
+            )
+
+        if last_batch:
+            vutils.save_image(
+                model.W,
+                os.path.join(output_path, 'images/weights/%06d.png' %(epoch)),
+                nrow=int(np.floor(np.sqrt(options.model.num_weights))),
+                padding=2,
+                normalize=True,
+            )
+            torch.save(
+                model.W,
+                os.path.join(output_path, 'images/weights/%06d.pth' %(epoch))
+            )
+            torch.save(
+                model.bh,
+                os.path.join(output_path, 'images/hbias/%06d.pth' %(epoch))
+            )
+
+            wid                += 1
+        
+            epoch              += 1
+            model.set_lr(epoch)
+
 
         iter_mark              += 1
 
