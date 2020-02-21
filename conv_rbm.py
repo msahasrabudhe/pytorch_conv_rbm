@@ -33,7 +33,7 @@ class ProbMaxPool(nn.Module):
         self.bc_pairs                       = torch.LongTensor([[b,c] for b in range(batch_size) for c in range(n_channels)]).cuda()
 
         self.this_state                     = torch.FloatTensor(batch_size, n_channels, self.mp * self.mp + 1).fill_(0).cuda()
-        self.choice                         = torch.FloatTensor(batch_size, n_channels, self.mp * self.mp + 1).fill_(0).cuda()
+        self.choice                         = torch.FloatTensor(batch_size, n_channels, 1).fill_(0).cuda()
         for r in range(0, rows, self.mp):
             for c in range(0, cols, self.mp):
                 self.this_state.fill_(0)
@@ -71,6 +71,7 @@ class ProbMaxPool(nn.Module):
 
         H_states                            = self.get_states(H_probs)
 
+
         return H_probs, H_states
 
 
@@ -80,7 +81,7 @@ class ConvRBM(nn.Module):
 
         self.options                        = options
         self.ws                             = options.model.weight_size
-        self.register_buffer('rev_idx', torch.arange(self.ws-1, -1, -1).long())
+        self.register_buffer('rev_idx_w', torch.arange(self.ws-1, -1, -1).long())
         self.nw_vis                         = options.model.channels
         self.nw_hid                         = options.model.num_weights
         self.mp                             = options.model.pool_size
@@ -104,7 +105,8 @@ class ConvRBM(nn.Module):
         self.lr_decay                       = options.optimiser.lr_decay
         self.lr_decay_step                  = options.optimiser.lr_decay_step
 
-        h_shape                             = (options.training.patch_size - self.ws + 1)
+        h_shape                             = options.training.patch_size - self.ws + 1
+        self.register_buffer('rev_idx_h', torch.arange(h_shape-1, -1, -1).long())
         self.prob_max_pool                  = ProbMaxPool((h_shape, h_shape), self.mp)
 
         self._loss_scaling_dict             = {}
@@ -112,7 +114,7 @@ class ConvRBM(nn.Module):
             self._loss_scaling_dict[_loss_name] = getattr(options.training, 'scale_' + _loss_name, 0)
 
         W_data                              = 1e-2 * torch.randn(self.nw_hid, self.nw_vis, self.ws, self.ws)
-        bh_data                             = - 1e-1 * torch.randn(self.nw_hid)
+        bh_data                             = - 0.1 * torch.ones(self.nw_hid)
         bv_data                             = 0 * torch.randn(self.nw_vis)
 
         self.register_buffer('W', W_data)
@@ -123,10 +125,21 @@ class ConvRBM(nn.Module):
 #        self.bh                             = nn.Parameter(data=bh_data)
 #        self.bv                             = nn.Parameter(data=bv_data)
 
-    def flip_updown(self, weight):
-        return weight[:,:,self.rev_idx,:][:,:,:,self.rev_idx]
+    def flip_updown(self, weight, h=False):
+        if h:
+            rev_idx                         = self.rev_idx_h
+        else:
+            rev_idx                         = self.rev_idx_w
+        return weight[:, :, rev_idx, :][:, :, :, rev_idx]
+# ===    return weight[:,:,self.rev_idx,:][:,:,:,self.rev_idx]
 
     def forward_conv(self, X):
+#        for _w in range(self.nw_hid):
+#            C                               = 1./(self.std_gaussian ** 2) * F.conv2d(X, self.W[[_w],:,:,:], bias=self.bh[_w:_w+1], stride=1, padding=0)
+#            if _w == 0:
+#                H                           = C
+#            else:
+#                H                           = torch.cat((H, C), dim=1)
         H                                   = 1./(self.std_gaussian ** 2) * F.conv2d(X, self.W, bias=self.bh, stride=1, padding=0)
 #        H                                   = convolve(X, self.W, bias=self.bh)
 #        H                                   = 1./(self.std_gaussian ** 2) * H
@@ -135,7 +148,13 @@ class ConvRBM(nn.Module):
     def backward_conv(self, H):
         pad                                 = self.ws - 1
         bias                                = self.bv if self.use_vbias else None
-        Xhat                                = F.conv2d(H, self.flip_updown(self.W.transpose(0,1)), bias=bias, stride=1, padding=pad)
+#        for _w in range(self.nw_hid):
+#            C                               = F.conv2d(H[:, [_w], :, :], self.flip_updown(self.W[[_w],:,:,:]), bias=None, stride=1, padding=pad)
+#            if _w == 0:
+#                Xhat                        = C
+#            else:
+#                Xhat                        = Xhat + C
+        Xhat                                = F.conv2d(H, self.flip_updown(self.W.permute([1,0,2,3]), h=False), bias=bias, stride=1, padding=pad)
 #        Xhat                                = convolve(H, self.W.transpose(0,1).transpose(2,3), bias=bias, padding=pad)
         return Xhat
 
@@ -208,8 +227,8 @@ class ConvRBM(nn.Module):
         self.dW                             = self.W.grad
 
         dbiash                              = self._loss_scaling_dict['recon'] * (self.Hprobs0 - self.Hprobs).view(batch_size,-1,n_hidden).mean(dim=2).mean(dim=0) 
-        sparsity                            = self._loss_scaling_dict['sparsity'] * ( self.Hprobs0.view(batch_size,-1,n_hidden).mean(dim=2).mean(dim=0) - self.sparsity )
-        self.bh.grad                        = self.lr * (  (dbiash - sparsity) ) + self.momentum * self.dhbias
+        sparsity                            = self._loss_scaling_dict['sparsity'] * ( self.sparsity - self.Hprobs0.view(batch_size,-1,n_hidden).mean(dim=2).mean(dim=0) )
+        self.bh.grad                        = self.lr * (  (dbiash + sparsity) ) + self.momentum * self.dhbias
         self.dhbias                         = self.bh.grad
 
         if self.use_vbias:
@@ -249,7 +268,7 @@ class ConvRBM(nn.Module):
 
     def compute_losses(self):
         self.loss_recon                     = self._loss_scaling_dict['recon'] * torch.mean((self.X - self.Xhat) ** 2)
-        self.loss_sparsity                  = self._loss_scaling_dict['sparsity'] * (self.sparsity - torch.mean(self.Hprobs)) ** 2
+        self.loss_sparsity                  = self._loss_scaling_dict['sparsity'] * torch.mean((self.sparsity - self.Hprobs.mean(dim=-1).mean(dim=-1)) ** 2)
 
         self.loss_total                     = self.loss_recon + self.loss_sparsity
         return self.loss_total

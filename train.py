@@ -19,11 +19,14 @@ def write_flush(text, stream=sys.stdout):
 
 optim                           = torch.optim
 
-def main():
+def main(sys_string=None):
     parser                      = argparse.ArgumentParser()
     parser.add_argument('--cfg', default='', type=str, help='Path to configuration file.')
     parser.add_argument('--gpu_id', default=0, type=int, help='Which GPU to use.')
-    args                        = parser.parse_args()
+    if not sys_string:
+        args                    = parser.parse_args()
+    else:
+        args                    = parser.parse_args(sys_string.split(' '))
 
     torch.cuda.set_device(args.gpu_id)
 
@@ -109,6 +112,7 @@ def main():
         model.set_momentum(iter_mark)
 
         X, last_batch           = dataloader.next_batch(options.training.batch_size, options.training.patch_size)
+
 
         if options.training.cuda:
             X                   = X.cuda()
