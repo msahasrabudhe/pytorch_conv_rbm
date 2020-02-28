@@ -34,18 +34,19 @@ class DataLoader:
         for i in range(len(batch_ids)):
             xcoord     = p_indices[i,0]
             ycoord     = p_indices[i,1]
-            batch_img  = x[i, :, xcoord:xcoord+patch_size, ycoord:ycoord+patch_size]
-            if np.random.rand() > 0.5:
-                batch_img = batch_img[:,::-1,:]
-            if np.random.rand() > 0.5:
-                batch_img = batch_img[:,:,::-1]
+            batch_img  = x[i, :, :, :]
+#            if np.random.rand() > 0.5:
+#                batch_img = batch_img[:,::-1,:]
+#            if np.random.rand() > 0.5:
+#                batch_img = batch_img[:,:,::-1]
 
-            batch_img   = batch_img - batch_img.mean()
-            batch_img   = batch_img / np.sqrt((batch_img * batch_img).mean())
-            batch_img   = whiten(batch_img.squeeze())[None, ...]
-            batch_img   = batch_img - batch_img.mean()
-            batch_img   = batch_img / np.sqrt((batch_img * batch_img).mean())
-            batch_img   = np.sqrt(0.1) * batch_img
+#            batch_img   = (batch_img - batch_img.mean()) / (batch_img.std())
+#            batch_img   = whiten(batch_img.squeeze())[None, ...]
+#            batch_img   = batch_img - batch_img.mean()
+#            batch_img   = batch_img / np.sqrt((batch_img * batch_img).mean())
+#            batch_img   = np.sqrt(0.1) * batch_img
+
+            batch_img   = batch_img[:, xcoord:xcoord+patch_size, ycoord:ycoord+patch_size]
             b[i,:,:,:]  = batch_img
             
         X = torch.from_numpy(b).float()

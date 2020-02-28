@@ -1,0 +1,35 @@
+model:
+    channels: 1
+    weight_size: 10
+    num_weights: 24
+    pool_size: 2
+    sparsity: 0.0001
+    sigmoid: False
+    use_vbias: False
+    k_CD: 1
+
+optimiser: 
+    lr: 0.1
+    lr_decay: 0.1
+    lr_decay_step: [] #, 3000, 7000, 13000]
+    beta1: 0.9
+    beta2: 0.999
+
+training:
+    sigma_start: 0.2
+    sigma_stop: 0.1
+    load_model:
+    patch_size: 39
+    cuda: True
+    dataset_file: natural_whitened.npy
+    n_iter: 100000
+    batch_size: 1
+    weight_decay: 0.001
+    mom_init: 0.9
+    mom_final: 0.5
+    change_momentum: 200
+    scale_recon: 1
+    scale_sparsity: 10
+
+checkpoint:
+    step: 100

@@ -9,6 +9,23 @@ from IPython import embed
 
 LOSS_NAMES                                  = ['recon', 'sparsity']
 
+BKWD_CMPTBL_DICT = {
+    'optimiser'                     :   {
+        'lr_decay_step'                 :   [], #10000, 20000, 40000, 80000],
+    }
+}
+
+def fix_backward_compatibility(options, cmptbl_dict=BKWD_CMPTBL_DICT):
+    for key in cmptbl_dict:
+        val         = cmptbl_dict[key]
+        if key not in options:
+            if isinstance(val, dict):
+                options[key] = fix_backward_compatibility(options[key], cmptbl_dict=cmptbl_dict[key])
+            else:
+                options[key] = val
+    return options
+
+
 class ProbMaxPool(nn.Module):
     def __init__(self, p_size, mp):
         super(ProbMaxPool, self).__init__()
@@ -160,30 +177,36 @@ class ConvRBM(nn.Module):
 
     def fwbw(self, step=0):
         if step == 0:
-            self.H0                         = self.forward_conv(self.X)
-            self.Hprobs0, self.Hstates0     = self.prob_max_pool(self.H0)
             self.Xhat                       = self.backward_conv(self.Hstates0)
         else:
-            self.H                          = self.forward_conv(self.Xhat)
-            self.Hprobs, self.Hstates       = self.prob_max_pool(self.H)
             self.Xhat                       = self.backward_conv(self.Hstates)
+
+        self.H                              = self.forward_conv(self.Xhat)
+        self.Hprobs, self.Hstates           = self.prob_max_pool(self.H)
 
         return
 
     def forward(self, X):
         self.X                              = X
+        self.H0                             = self.forward_conv(self.X)
+        self.Hprobs0, self.Hstates0         = self.prob_max_pool(self.H0)
         for k in range(self.k_CD):
-            self.fwbw(step=k)
+            if k == 0:
+                Xhat                        = self.backward_conv(self.Hstates0)# + 0.1 * torch.randn(self.X.shape).cuda()
+            else:
+                Xhat                        = self.backward_conv(Hstates)# + 0.1 * torch.randn(self.X.shape).cuda()
 
-        # Final forward pass, get H from X
-        self.H                              = self.forward_conv(self.Xhat)
-        self.Hprobs, self.Hstates           = self.prob_max_pool(self.H)
+            H                               = self.forward_conv(Xhat)
+            Hprobs, Hstates                 = self.prob_max_pool(H)
+
+        self.Xhat                           = Xhat
+        self.Hprobs, self.Hstates           = Hprobs, Hstates
 
         # Fix decay. 
         if self.std_gaussian > self.sigma_stop:
             self.std_gaussian               = self.std_gaussian * 0.99
 
-        return self.Xhat
+        return Xhat
 
     def set_momentum(self, it):
         if it < self.change_momentum:

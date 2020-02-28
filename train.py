@@ -42,6 +42,7 @@ def main(sys_string=None):
         options                 = yaml.safe_load(fp)
 
     options                     = make_recursive_attr_dict(options)
+    options                     = fix_backward_compatibility(options)
 
     model                       = ConvRBM(options)
 
@@ -112,7 +113,7 @@ def main(sys_string=None):
         model.set_momentum(iter_mark)
 
         X, last_batch           = dataloader.next_batch(options.training.batch_size, options.training.patch_size)
-
+        X                       = X - X.mean()
 
         if options.training.cuda:
             X                   = X.cuda()
